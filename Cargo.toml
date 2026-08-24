@@ -1,0 +1,22 @@
+[package]
+name = "ocpp-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+env_logger = "0.11.11"
+futures = "0.3.33"
+log = "0.4.33"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-tungstenite = "0.30.0"
+# tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+# rustls = { version = "0.23", features = ["aws_lc_rs"] }
+
+[profile.release-slim]
+inherits = "release"
+strip = "symbols"
+lto = "fat"
+panic = "abort"
+codegen-units = 1
