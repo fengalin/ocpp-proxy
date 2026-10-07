@@ -1,12 +1,13 @@
 use anyhow::Context;
 use clap::Parser;
-use futures::{future::FusedFuture, pin_mut, prelude::*};
+use futures::prelude::*;
 use log::*;
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     ops::ControlFlow,
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite as ts};
 
 const PROXY_PORT: u16 = 9000;
@@ -18,85 +19,142 @@ pub struct Args {
     pub server_ip: String,
 }
 
-async fn start(
-    cp_ws_stream: TcpStream,
-    server_address: &str,
-    mut ctrl_c: std::pin::Pin<&mut impl FusedFuture<Output = Result<(), std::io::Error>>>,
-) -> anyhow::Result<ControlFlow<()>> {
-    let mut cp_ws_stream = accept_async(cp_ws_stream).await?;
-
-    let (mut server_ws_stream, server_response) = connect_async(server_address).await?;
-    info!("Connected to: {server_address}");
-    info!("Response HTTP cpde: {}", server_response.status());
-    for (header, _value) in server_response.headers() {
-        info!("* {header}");
-    }
-
-    let mut cp_message = None;
-    let mut server_message = None;
-
-    let mut prev_ctl_flow = ControlFlow::Continue::<()>(());
+async fn run(
+    mut stop_rx: mpsc::Receiver<()>,
+    listener: TcpListener,
+    addr: SocketAddrV4,
+    server_address: String,
+) -> anyhow::Result<()> {
     loop {
-        // FIXME add timeout to exit after a ws close was detected
-        futures::select_biased! {
-            _ = ctrl_c => {
-                warn!("shutting down due to SIGINT");
-                match server_ws_stream.close(None).await.context("closing server websocket") {
-                    Ok(_) => {
-                        let recv_res = server_ws_stream.next().await;
-                        info!("server replied {recv_res:?}");
-                    }
-                    Err(err) => error!("{err}"),
-                }
-                cp_ws_stream.close(None).await.context("closing charging point websocket")?;
-                let recv_res = cp_ws_stream.next().await;
-                info!("charging point replied {recv_res:?}");
-                return Ok(ControlFlow::Break(()));
+        info!("Listening on: {addr}");
+
+        let (cp_ws_stream, cp_addr) = tokio::select! {
+            biased;
+            _ = stop_rx.recv() => {
+                info!("terminating due to stop cmd");
+                break;
             }
-            message = cp_ws_stream.next() => cp_message = message,
-            message = server_ws_stream.next() => server_message = message,
+            cp_accept_res = listener.accept() => {
+                cp_accept_res.context("listening to CP")?
+            }
         };
 
-        let mut cp_ctrl_flow = ControlFlow::Continue(());
-        if let Some(cp_msg) = cp_message.take() {
-            let cp_msg = cp_msg.inspect_err(|err| match err {
-                ts::Error::ConnectionClosed | ts::Error::Protocol(_) | ts::Error::Utf8(_) => (),
-                other => error!("Error processing cp message: {other}"),
-            })?;
+        info!("peer address {cp_addr}");
 
-            cp_ctrl_flow = handle_incoming_ws_message(cp_msg, "cp ", &mut server_ws_stream)
-                .await
-                .context("fowarding cp message")?;
+        let mut cp_ws_stream = tokio::select! {
+            biased;
+            _ = stop_rx.recv() => {
+                info!("terminating due to stop cmd");
+                return Ok(());
+            }
+            cp_ws_accept_res = accept_async(cp_ws_stream) => {
+                match cp_ws_accept_res {
+                    Ok(cp_ws_stream) => cp_ws_stream,
+                    Err(err) => {
+                        error!("accepting CP WS stream: {err}");
+                        continue;
+                    }
+                }
+            }
         };
 
-        let mut server_ctrl_flow = ControlFlow::Continue(());
-        if let Some(server_msg) = server_message.take() {
-            let server_msg = server_msg.inspect_err(|err| match err {
-                ts::Error::ConnectionClosed | ts::Error::Protocol(_) | ts::Error::Utf8(_) => (),
-                other => error!("Error processing server message: {other}"),
-            })?;
-
-            server_ctrl_flow = handle_incoming_ws_message(server_msg, "srv", &mut cp_ws_stream)
-                .await
-                .context("fowarding server message")?;
+        let (mut server_ws_stream, server_response) = loop {
+            tokio::select! {
+                biased;
+                _ = stop_rx.recv() => {
+                    info!("terminating due to stop cmd");
+                    let _ = cp_ws_stream.close(None).await;
+                    return Ok(());
+                }
+                server_connect_res = connect_async(&server_address) => {
+                    match server_connect_res {
+                        Ok(server_connect_ret) => break server_connect_ret,
+                        Err(err) => {
+                            error!("conecting to server: {err}");
+                            let _ = cp_ws_stream.close(None).await;
+                            // FIXME might want to give up after a few tries?
+                            continue;
+                        }
+                    }
+                }
+            }
         };
 
-        if prev_ctl_flow.is_break() {
-            warn!("exiting due to previous Close message");
-            break;
+        info!("Connected to: {server_address}");
+        info!("Response HTTP code: {}", server_response.status());
+        for (header, _value) in server_response.headers() {
+            info!("* {header}");
         }
 
-        if cp_ctrl_flow.is_break() && server_ctrl_flow.is_break() {
-            warn!("exiting due Close handshake");
-            break;
-        }
+        let mut cp_message = None;
+        let mut server_message = None;
 
-        if cp_ctrl_flow.is_break() || server_ctrl_flow.is_break() {
-            prev_ctl_flow = ControlFlow::Break(());
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop_rx.recv() => {
+                    info!("terminating due to stop cmd");
+                    let _ = server_ws_stream.close(None).await;
+                    let _ = cp_ws_stream.close(None).await;
+                    return Ok(());
+                }
+                message = cp_ws_stream.next() => cp_message = message,
+                message = server_ws_stream.next() => server_message = message,
+            }
+
+            if let Some(cp_msg) = cp_message.take() {
+                let cp_msg = match cp_msg {
+                    Ok(cp_msg) => cp_msg,
+                    Err(err) => {
+                        error!("processing cp message: {err}");
+                        let _ = server_ws_stream.close(None).await;
+                        break;
+                    }
+                };
+
+                match handle_incoming_ws_message(cp_msg, "cp ", &mut server_ws_stream).await {
+                    Ok(ctrl_flow) if ctrl_flow.is_break() => {
+                        warn!("CP ws terminated");
+                        let _ = server_ws_stream.close(None).await;
+                        break;
+                    }
+                    Err(err) => {
+                        error!("handling message from CP: {err}");
+                        // FIXME probably permanent
+                        continue;
+                    }
+                    _ => (),
+                }
+            }
+
+            if let Some(server_msg) = server_message.take() {
+                let server_msg = match server_msg {
+                    Ok(server_msg) => server_msg,
+                    Err(err) => {
+                        error!("processing server message: {err}");
+                        let _ = cp_ws_stream.close(None).await;
+                        break;
+                    }
+                };
+
+                match handle_incoming_ws_message(server_msg, "srv", &mut cp_ws_stream).await {
+                    Ok(ctrl_flow) if ctrl_flow.is_break() => {
+                        warn!("Server ws terminated");
+                        let _ = cp_ws_stream.close(None).await;
+                        break;
+                    }
+                    Err(err) => {
+                        error!("handling message from Server: {err}");
+                        // FIXME probably permanent
+                        continue;
+                    }
+                    _ => (),
+                }
+            }
         }
     }
 
-    Ok(ControlFlow::Continue(()))
+    Ok(())
 }
 
 async fn handle_incoming_ws_message<D: Sink<ts::Message> + Unpin>(
@@ -162,35 +220,16 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bindind to {addr}"))?;
 
-    loop {
-        let ctrl_c = tokio::signal::ctrl_c().fuse();
-        pin_mut!(ctrl_c);
+    let (stop_tx, stop_rx) = mpsc::channel(8);
 
-        info!("Listening on: {addr}");
-        let accept_stream = listener.accept().fuse();
-        pin_mut!(accept_stream);
+    let run_hdl = tokio::spawn(run(stop_rx, listener, addr, server_address));
 
-        futures::select_biased! {
-            _ = ctrl_c => {
-                warn!("shutting down due to SIGINT");
-                break;
-            }
-            accept_res = accept_stream => {
-                let Ok((ws_stream, _)) = accept_res else {
-                    warn!("TCP listener terminated");
-                    continue;
-                };
-                let peer = ws_stream.peer_addr().context("getting peer address")?;
-                info!("peer address {peer}");
+    let _ = tokio::signal::ctrl_c().await;
+    warn!("shutting down due to SIGINT");
 
-                match start(ws_stream, &server_address, ctrl_c.as_mut()).await {
-                    Ok(ret) if ret.is_break() => break,
-                    Ok(_) => (),
-                    Err(err) =>
-                        error!("terminating connection: {err:?}"),
-                }
-            }
-        }
+    let _ = stop_tx.send(()).await;
+    if let Ok(Err(err)) = run_hdl.await {
+        error!("proxy terminated: {err}");
     }
 
     Ok(())
